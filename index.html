@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Chat</title>
+    <style>
+        #messages {
+            border: 1px solid #ccc;
+            padding: 10px;
+            height: 200px;
+            overflow-y: scroll;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Chat</h1>
+    <button onclick="getRandomString()">Get Random String</button>
+    <div id="randomString"></div>
+    
+    <div>
+        <input type="text" id="sessionID" placeholder="Enter session ID...">
+        <button onclick="connectWebSocket()">Connect</button>
+    </div>
+    
+    <input type="text" id="message" placeholder="Enter message...">
+    <button onclick="sendMessage()">Send</button>
+    
+    <div id="messages"></div>
+
+    <script>
+        var socket;
+
+        function getRandomString() {
+            fetch('http://localhost:8080/random-string')
+                .then(response => response.json())
+                .then(data => {
+                    var sessionID = data.session_id;
+                    document.getElementById("randomString").innerText = "Generated Session ID: " + sessionID;
+                    document.getElementById("sessionID").value = sessionID;
+                });
+        }
+
+        function connectWebSocket() {
+            var sessionID = document.getElementById("sessionID").value;
+            if (!sessionID) {
+                alert("Please enter a session ID");
+                return;
+            }
+
+            socket = new WebSocket("ws://localhost:8080/ws/" + sessionID);
+
+            socket.onopen = function() {
+                console.log("Connected to session: " + sessionID);
+                document.getElementById("messages").innerHTML += "<p>Connected to session: " + sessionID + "</p>";
+            };
+
+            socket.onmessage = function(event) {
+                var messagesDiv = document.getElementById("messages");
+                messagesDiv.innerHTML += "<p>" + event.data + "</p>";
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            };
+
+            socket.onclose = function() {
+                document.getElementById("messages").innerHTML += "<p>Disconnected from session: " + sessionID + "</p>";
+            };
+        }
+
+        function sendMessage() {
+            var input = document.getElementById("message");
+            var message = input.value;
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(message);
+                input.value = "";
+            } else {
+                alert("WebSocket connection is not open.");
+            }
+        }
+    </script>
+</body>
+</html>
