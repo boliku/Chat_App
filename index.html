@@ -28,19 +28,20 @@
 
     <script>
         var socket;
+        var sessionID;
 
         function getRandomString() {
             fetch('http://localhost:8080/random-string')
                 .then(response => response.json())
                 .then(data => {
-                    var sessionID = data.session_id;
+                    sessionID = data.session_id;
                     document.getElementById("randomString").innerText = "Generated Session ID: " + sessionID;
                     document.getElementById("sessionID").value = sessionID;
                 });
         }
 
         function connectWebSocket() {
-            var sessionID = document.getElementById("sessionID").value;
+            sessionID = document.getElementById("sessionID").value;
             if (!sessionID) {
                 alert("Please enter a session ID");
                 return;

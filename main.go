@@ -28,11 +28,11 @@ type RandomStringResponse struct {
 	SessionID string `json:"session_id"`
 }
 
-// Generar string aleatorio
-func generateRandomString(n int) string {
+// Generar y devolver un string aleatorio y único
+func getRandomString() string {
 	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	rand.Seed(time.Now().UnixNano())
-	b := make([]byte, n)
+	b := make([]byte, 10)
 	for i := range b {
 		b[i] = letters[rand.Intn(len(letters))]
 	}
@@ -62,15 +62,34 @@ func main() {
 	// Aplicar el middleware CORS
 	r.Use(CORSMiddleware())
 
+	// Mapa para almacenar los strings aleatorios generados
+	randomStrings := make(map[string]bool)
+
 	// Endpoint para obtener el string aleatorio
 	r.GET("/random-string", func(c *gin.Context) {
-		sessionID := generateRandomString(10)
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		sessionID := getRandomString()
+		randomStrings[sessionID] = true
+
 		c.JSON(http.StatusOK, RandomStringResponse{SessionID: sessionID})
 	})
 
 	// Endpoint para WebSocket
 	r.GET("/ws/:sessionID", func(c *gin.Context) {
 		sessionID := c.Param("sessionID")
+
+		// Verificar si el sessionID es válido
+		mutex.Lock()
+		valid := randomStrings[sessionID]
+		mutex.Unlock()
+
+		if !valid {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid session ID"})
+			return
+		}
+
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
