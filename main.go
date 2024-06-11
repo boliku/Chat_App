@@ -1,136 +1,176 @@
 package main
 
 import (
-	"math/rand"
+	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+
+	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 )
 
-// Upgrader para WebSocket
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+var db *gorm.DB
+var jwtSecret = []byte("tu_secreto")
+
+type User struct {
+	ID       uint   `gorm:"primaryKey"`
+	Username string `gorm:"unique"`
+	Password string
 }
 
-// Mapa de sesiones
-var sessions = make(map[string][]*websocket.Conn)
-var mutex = &sync.Mutex{}
-
-// Estructura para respuesta del string aleatorio
-type RandomStringResponse struct {
-	SessionID string `json:"session_id"`
+type Claims struct {
+	Username string `json:"username"`
+	jwt.StandardClaims
 }
 
-// Generar y devolver un string aleatorio y único
-func getRandomString() string {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	rand.Seed(time.Now().UnixNano())
-	b := make([]byte, 10)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
+func main() {
+	// Configurar la conexión a la base de datos
+	dsn := "host=localhost user=postgres password=Kamezennin dbname=chat_app port=5432 sslmode=disable TimeZone=Asia/Shanghai"
+	var err error
+	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		fmt.Println("No se pudo conectar a la base de datos:", err)
+		return
 	}
-	return string(b)
+
+	// Migrar modelos
+	db.AutoMigrate(&User{})
+
+	r := gin.Default()
+
+	// Endpoints
+	r.POST("/register", registerHandler)
+	r.POST("/login", loginHandler)
+	r.GET("/protected", authMiddleware(), protectedHandler)
+
+	// Iniciar el servidor
+	r.Run(":8080")
 }
 
-// Middleware para habilitar CORS
-func CORSMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT")
+func protectedHandler(c *gin.Context) {
+	user, _ := c.Get("user")
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Hello, %s!", user.(*jwt.Token).Claims.(*Claims).Username)})
+}
 
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenString := c.GetHeader("Authorization")
+		if tokenString == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing authorization token"})
+			c.Abort()
 			return
 		}
 
+		// Añadir log para verificar el token recibido
+		fmt.Println("Received token:", tokenString)
+
+		token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+			return jwtSecret, nil
+		})
+		if err != nil {
+			fmt.Println("Error parsing token:", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired authorization token"})
+			c.Abort()
+			return
+		}
+		if !token.Valid {
+			fmt.Println("Invalid token")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired authorization token"})
+			c.Abort()
+			return
+		}
+
+		c.Set("user", token)
 		c.Next()
 	}
 }
 
-func main() {
-	r := gin.Default()
+func registerHandler(c *gin.Context) {
+	var newUser User
+	if err := c.BindJSON(&newUser); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
 
-	// Aplicar el middleware CORS
-	r.Use(CORSMiddleware())
+	// Verificar si el nombre de usuario ya existe
+	var existingUser User
+	result := db.Where("username = ?", newUser.Username).First(&existingUser)
+	if result.RowsAffected != 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Username already exists"})
+		return
+	}
 
-	// Mapa para almacenar los strings aleatorios generados
-	randomStrings := make(map[string]bool)
+	// Hash de la contraseña
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+		return
+	}
+	newUser.Password = string(hashedPassword)
 
-	// Endpoint para obtener el string aleatorio
-	r.GET("/random-string", func(c *gin.Context) {
-		mutex.Lock()
-		defer mutex.Unlock()
+	// Crear usuario en la base de datos
+	if err := db.Create(&newUser).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
+		return
+	}
 
-		sessionID := getRandomString()
-		randomStrings[sessionID] = true
+	c.JSON(http.StatusOK, gin.H{"message": "User registered successfully"})
+}
 
-		c.JSON(http.StatusOK, RandomStringResponse{SessionID: sessionID})
-	})
+func loginHandler(c *gin.Context) {
+	var loginData struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := c.BindJSON(&loginData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
 
-	// Endpoint para WebSocket
-	r.GET("/ws/:sessionID", func(c *gin.Context) {
-		sessionID := c.Param("sessionID")
+	// Buscar usuario en la base de datos
+	var user User
+	result := db.Where("username = ?", loginData.Username).First(&user)
+	if result.Error != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+		return
+	}
 
-		// Verificar si el sessionID es válido
-		mutex.Lock()
-		valid := randomStrings[sessionID]
-		mutex.Unlock()
+	// Verificar la contraseña
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(loginData.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+		return
+	}
 
-		if !valid {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid session ID"})
-			return
-		}
+	// Generar token JWT
+	token, err := generateToken(user.Username)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		return
+	}
 
-		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		defer conn.Close()
+	c.JSON(http.StatusOK, gin.H{"success": "User Login Successful"})
+	c.JSON(http.StatusOK, gin.H{"token": token})
+}
 
-		mutex.Lock()
-		sessions[sessionID] = append(sessions[sessionID], conn)
-		mutex.Unlock()
+func generateToken(username string) (string, error) {
+	claims := Claims{
+		Username: username,
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: time.Now().Add(time.Hour * 24).Unix(), // Token expira en 24 horas
+			IssuedAt:  time.Now().Unix(),
+			Issuer:    "chat_app",
+		},
+	}
 
-		for {
-			// Leer mensaje
-			messageType, message, err := conn.ReadMessage()
-			if err != nil {
-				break
-			}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString(jwtSecret)
+	if err != nil {
+		return "", err
+	}
 
-			// Enviar mensaje a todas las conexiones en la sesión
-			mutex.Lock()
-			for _, c := range sessions[sessionID] {
-				if c != conn {
-					if err := c.WriteMessage(messageType, message); err != nil {
-						break
-					}
-				}
-			}
-			mutex.Unlock()
-		}
-
-		// Remover conexión de la sesión al desconectar
-		mutex.Lock()
-		for i, c := range sessions[sessionID] {
-			if c == conn {
-				sessions[sessionID] = append(sessions[sessionID][:i], sessions[sessionID][i+1:]...)
-				break
-			}
-		}
-		mutex.Unlock()
-	})
-
-	// Iniciar servidor en puerto 8080
-	r.Run(":8080")
+	return tokenString, nil
 }
