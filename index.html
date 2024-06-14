@@ -13,45 +13,71 @@
 </head>
 <body>
     <h1>WebSocket Chat</h1>
-    <button onclick="getRandomString()">Get Random String</button>
-    <div id="randomString"></div>
-    
-    <div>
-        <input type="text" id="sessionID" placeholder="Enter session ID...">
-        <button onclick="connectWebSocket()">Connect</button>
+    <div id="login">
+        <input type="text" id="username" placeholder="Enter username...">
+        <input type="password" id="password" placeholder="Enter password...">
+        <button onclick="login()">Login</button>
+        <button onclick="register()">Register</button>
     </div>
-    
-    <input type="text" id="message" placeholder="Enter message...">
-    <button onclick="sendMessage()">Send</button>
-    
-    <div id="messages"></div>
+
+    <div id="chat" style="display:none">
+        <input type="text" id="message" placeholder="Enter message...">
+        <button onclick="sendMessage()">Send</button>
+        
+        <div id="messages"></div>
+    </div>
 
     <script>
         var socket;
-        var sessionID;
+        var token;
 
-        function getRandomString() {
-            fetch('http://localhost:8080/random-string')
-                .then(response => response.json())
-                .then(data => {
-                    sessionID = data.session_id;
-                    document.getElementById("randomString").innerText = "Generated Session ID: " + sessionID;
-                    document.getElementById("sessionID").value = sessionID;
-                });
+        function login() {
+            var username = document.getElementById("username").value;
+            var password = document.getElementById("password").value;
+            fetch('http://localhost:8080/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ username: username, password: password })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.token) {
+                    token = data.token;
+                    document.getElementById("login").style.display = "none";
+                    document.getElementById("chat").style.display = "block";
+                    document.getElementById("messages").innerHTML = "<p>Logged in successfully.</p>";
+
+                    // Conectar al WebSocket después del login
+                    connectWebSocket();
+                } else {
+                    alert("Invalid username or password.");
+                }
+            });
+        }
+
+        function register() {
+            var username = document.getElementById("username").value;
+            var password = document.getElementById("password").value;
+            fetch('http://localhost:8080/register', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ username: username, password: password })
+            })
+            .then(response => response.json())
+            .then(data => {
+                alert(data.message);
+            });
         }
 
         function connectWebSocket() {
-            sessionID = document.getElementById("sessionID").value;
-            if (!sessionID) {
-                alert("Please enter a session ID");
-                return;
-            }
-
-            socket = new WebSocket("ws://localhost:8080/ws/" + sessionID);
+            socket = new WebSocket("ws://localhost:8080/ws?token=" + token);
 
             socket.onopen = function() {
-                console.log("Connected to session: " + sessionID);
-                document.getElementById("messages").innerHTML += "<p>Connected to session: " + sessionID + "</p>";
+                console.log("Connected to WebSocket");
             };
 
             socket.onmessage = function(event) {
@@ -61,20 +87,28 @@
             };
 
             socket.onclose = function() {
-                document.getElementById("messages").innerHTML += "<p>Disconnected from session: " + sessionID + "</p>";
+                console.log("WebSocket connection closed");
             };
         }
 
         function sendMessage() {
-            var input = document.getElementById("message");
-            var message = input.value;
-            if (socket && socket.readyState === WebSocket.OPEN) {
-                socket.send(message);
-                input.value = "";
-            } else {
-                alert("WebSocket connection is not open.");
-            }
-        }
+    var messageInput = document.getElementById("message");
+    var message = messageInput.value.trim();
+    
+    if (message === "") {
+        return;
+    }
+
+    var data = {
+        content: message
+    };
+
+    // Enviar mensaje al servidor WebSocket
+    socket.send(JSON.stringify(data));
+
+    // Limpiar el campo de entrada después de enviar el mensaje
+    messageInput.value = "";
+}
     </script>
 </body>
 </html>

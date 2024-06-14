@@ -2,119 +2,108 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
-	"time"
-
-	"golang.org/x/crypto/bcrypt"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
+	"sync"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
-var db *gorm.DB
-var jwtSecret = []byte("tu_secreto")
+// Upgrader para WebSocket
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
 
+var (
+	db        *gorm.DB
+	mutex     = &sync.Mutex{}
+	clients   = make(map[*websocket.Conn]bool)
+	broadcast = make(chan Message)
+)
+
+// Estructura de usuario
 type User struct {
 	ID       uint   `gorm:"primaryKey"`
 	Username string `gorm:"unique"`
 	Password string
 }
 
-type Claims struct {
+// Estructura de mensaje
+type Message struct {
 	Username string `json:"username"`
-	jwt.StandardClaims
+	Content  string `json:"content"`
 }
 
-func main() {
-	// Configurar la conexión a la base de datos
-	dsn := "host=localhost user=postgres password=Kamezennin dbname=chat_app port=5432 sslmode=disable TimeZone=Asia/Shanghai"
-	var err error
-	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	if err != nil {
-		fmt.Println("No se pudo conectar a la base de datos:", err)
-		return
-	}
+// JWTSecret es la clave secreta para firmar los tokens JWT
+var JWTSecret = []byte("secret")
 
-	// Migrar modelos
-	db.AutoMigrate(&User{})
-
-	r := gin.Default()
-
-	// Endpoints
-	r.POST("/register", registerHandler)
-	r.POST("/login", loginHandler)
-	r.GET("/protected", authMiddleware(), protectedHandler)
-
-	// Iniciar el servidor
-	r.Run(":8080")
-}
-
-func protectedHandler(c *gin.Context) {
-	user, _ := c.Get("user")
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Hello, %s!", user.(*jwt.Token).Claims.(*Claims).Username)})
-}
-
-func authMiddleware() gin.HandlerFunc {
+// Middleware para habilitar CORS
+func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		tokenString := c.GetHeader("Authorization")
-		if tokenString == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing authorization token"})
-			c.Abort()
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
 			return
 		}
 
-		// Añadir log para verificar el token recibido
-		fmt.Println("Received token:", tokenString)
-
-		token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-			return jwtSecret, nil
-		})
-		if err != nil {
-			fmt.Println("Error parsing token:", err)
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired authorization token"})
-			c.Abort()
-			return
-		}
-		if !token.Valid {
-			fmt.Println("Invalid token")
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired authorization token"})
-			c.Abort()
-			return
-		}
-
-		c.Set("user", token)
 		c.Next()
 	}
 }
 
-func registerHandler(c *gin.Context) {
-	var newUser User
-	if err := c.BindJSON(&newUser); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
-		return
-	}
-
-	// Verificar si el nombre de usuario ya existe
-	var existingUser User
-	result := db.Where("username = ?", newUser.Username).First(&existingUser)
-	if result.RowsAffected != 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Username already exists"})
-		return
-	}
-
-	// Hash de la contraseña
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.Password), bcrypt.DefaultCost)
+func initDB() {
+	dsn := "host=localhost user=postgres password=Kamezennin dbname=chat_app port=5432 sslmode=disable TimeZone=Asia/Shanghai"
+	var err error
+	db, err = gorm.Open(postgres.New(postgres.Config{
+		DSN:                  dsn,
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Info),
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+		panic("failed to connect database")
+	}
+	db.AutoMigrate(&User{})
+}
+
+
+func main() {
+	initDB()
+
+	r := gin.Default()
+	r.Use(CORSMiddleware())
+
+	r.POST("/register", registerHandler)
+	r.POST("/login", loginHandler)
+	r.GET("/ws", websocketHandler)
+
+	go handleMessages()
+
+	// Iniciar servidor en puerto 8080
+	r.Run(":8080")
+}
+
+func registerHandler(c *gin.Context) {
+	var input User
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	newUser.Password = string(hashedPassword)
 
-	// Crear usuario en la base de datos
-	if err := db.Create(&newUser).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
+	if err := db.Create(&input).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -122,55 +111,128 @@ func registerHandler(c *gin.Context) {
 }
 
 func loginHandler(c *gin.Context) {
-	var loginData struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := c.BindJSON(&loginData); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
-		return
-	}
-
-	// Buscar usuario en la base de datos
 	var user User
-	result := db.Where("username = ?", loginData.Username).First(&user)
-	if result.Error != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+	var input User
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Verificar la contraseña
-	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(loginData.Password)); err != nil {
+	if err := db.Where("username = ? AND password = ?", input.Username, input.Password).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
 		return
 	}
 
 	// Generar token JWT
-	token, err := generateToken(user.Username)
+	tokenString, err := generateJWTToken(user.Username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": "User Login Successful"})
-	c.JSON(http.StatusOK, gin.H{"token": token})
+	c.JSON(http.StatusOK, gin.H{"token": tokenString})
 }
 
-func generateToken(username string) (string, error) {
-	claims := Claims{
-		Username: username,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: time.Now().Add(time.Hour * 24).Unix(), // Token expira en 24 horas
-			IssuedAt:  time.Now().Unix(),
-			Issuer:    "chat_app",
-		},
+func websocketHandler(c *gin.Context) {
+	tokenString := c.Query("token")
+	if tokenString == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Token is required"})
+		return
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(jwtSecret)
+	// Validar y decodificar token
+	username, err := getUsernameFromToken(tokenString)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		return
+	}
+
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Println(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer conn.Close()
+
+	// Registrar cliente conectado
+	mutex.Lock()
+	clients[conn] = true
+	mutex.Unlock()
+
+	for {
+		var msg Message
+
+		// Leer mensaje JSON desde el cliente
+		err := conn.ReadJSON(&msg)
+		if err != nil {
+			log.Println("Error reading JSON:", err)
+			break
+		}
+
+		// Agregar nombre de usuario al mensaje antes de broadcastear
+		msg.Username = username
+
+		// Enviar mensaje a todos los clientes conectados
+		broadcast <- msg
+	}
+
+	// Cuando salga del bucle, eliminar cliente y cerrar conexión
+	mutex.Lock()
+	delete(clients, conn)
+	mutex.Unlock()
+}
+
+func handleMessages() {
+	for {
+		// Broadcast del mensaje a todos los clientes conectados
+		msg := <-broadcast
+		for client := range clients {
+			err := client.WriteJSON(msg)
+			if err != nil {
+				log.Println("Error writing JSON to client:", err)
+				client.Close()
+				mutex.Lock()
+				delete(clients, client)
+				mutex.Unlock()
+			}
+		}
+	}
+}
+
+func generateJWTToken(username string) (string, error) {
+	token := jwt.New(jwt.SigningMethodHS256)
+	claims := token.Claims.(jwt.MapClaims)
+	claims["username"] = username
+	tokenString, err := token.SignedString(JWTSecret)
+	if err != nil {
+		return "", err
+	}
+	return tokenString, nil
+}
+
+func getUsernameFromToken(tokenString string) (string, error) {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		// Validar el algoritmo de firma
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+		}
+		return JWTSecret, nil
+	})
 	if err != nil {
 		return "", err
 	}
 
-	return tokenString, nil
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		return "", fmt.Errorf("Invalid token")
+	}
+
+	username, ok := claims["username"].(string)
+	if !ok {
+		return "", fmt.Errorf("Invalid token")
+	}
+
+	return username, nil
 }
