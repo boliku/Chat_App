@@ -3,6 +3,8 @@ package routes
 import (
 	"net/http"
 
+	"Chat_App/controllers"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -26,6 +28,9 @@ func SetupRouter() *gin.Engine {
             "title": "Bienvenido",
         })
     })
+
+    router.POST("/register", controllers.Register)
+	router.POST("/login", controllers.Login)
 
     return router
 }
